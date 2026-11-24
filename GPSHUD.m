@@ -1,9 +1,32 @@
-// GPSHUD.m — 零依赖版本（不依赖 Cydia Substrate / ElleKit）
-// 仅用系统 Objective-C runtime 做 method swizzling，适合巨魔(TrollStore)注入。
+// GPSHUD.m — 零依赖版本 v2
+// 修复点：
+//  1. iOS 13+ SceneDelegate 下自建 UIWindow 不显示 → 改为挂到宿主 keyWindow
+//  2. 加震动信号：加载成功时震动一下，便于确认 dylib 是否真的被加载
+//  3. 多重显示时机 + 日志，便于诊断
+// 不依赖 Cydia Substrate / ElleKit，适合 TrollFools / TrollStore 注入。
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <CoreLocation/CoreLocation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
+
+#pragma mark - 日志（NSLog + 落盘，便于导出诊断）
+
+static void GPSHUDWriteLog(NSString *line) {
+    NSLog(@"[GPSHUD] %@", line);
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!dir) return;
+    NSString *path = [dir stringByAppendingPathComponent:@"gpshud_diag.log"];
+    NSString *full = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], line];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[full dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [full writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
 
 #pragma mark - 自检浮窗
 
@@ -46,7 +69,7 @@
 
 @interface GPSHUDManager : NSObject
 @property (nonatomic, strong) NSHashTable<CLLocationManager *> *managers;
-@property (nonatomic, strong) UIWindow *hudWindow;
+@property (nonatomic, strong) UIWindow *fallbackWindow;
 @property (nonatomic, strong) GPSHUDView *hudView;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) NSInteger hookHits;
@@ -78,38 +101,86 @@
     [self.managers addObject:m];
 }
 
-- (void)showHUD {
-    if (self.hudWindow) return;
+// 找到当前显示中的 keyWindow（兼容 iOS 13+ SceneDelegate）
+- (UIWindow *)findKeyWindow {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in [[UIApplication sharedApplication] connectedScenes]) {
+            if (scene.activationState == UISceneActivationStateForegroundActive &&
+                [scene isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *ws = (UIWindowScene *)scene;
+                for (UIWindow *w in ws.windows) {
+                    if (w.isKeyWindow) return w;
+                }
+                if (ws.windows.firstObject) return ws.windows.firstObject;
+            }
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return [[UIApplication sharedApplication] keyWindow];
+#pragma clang diagnostic pop
+}
 
-    UIWindow *window = [[UIWindow alloc] initWithFrame:CGRectZero];
-    window.windowLevel = UIWindowLevelAlert + 100;
-    window.backgroundColor = [UIColor clearColor];
-    window.userInteractionEnabled = NO; // 不拦截触摸
+- (void)showHUD {
+    if (self.hudView && self.hudView.superview) {
+        return; // 已经显示
+    }
 
     GPSHUDView *view = [[GPSHUDView alloc] initWithFrame:CGRectZero];
     view.translatesAutoresizingMaskIntoConstraints = NO;
-    [window addSubview:view];
     self.hudView = view;
 
-    [NSLayoutConstraint activateConstraints:@[
-        [view.topAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.topAnchor constant:55],
-        [view.leadingAnchor constraintEqualToAnchor:window.leadingAnchor constant:12],
-        [view.widthAnchor constraintEqualToConstant:265],
-    ]];
+    UIWindow *host = [self findKeyWindow];
+    if (host) {
+        // 方案 A（首选）：直接挂到宿主 keyWindow，必定可见
+        [host addSubview:view];
+        [NSLayoutConstraint activateConstraints:@[
+            [view.topAnchor constraintEqualToAnchor:host.safeAreaLayoutGuide.topAnchor constant:55],
+            [view.leadingAnchor constraintEqualToAnchor:host.leadingAnchor constant:12],
+            [view.widthAnchor constraintEqualToConstant:265],
+        ]];
+        GPSHUDWriteLog(@"HUD attached to host keyWindow");
+    } else {
+        // 方案 B（兜底）：自建 window，绑定 active scene
+        UIWindow *window = nil;
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *scene in [[UIApplication sharedApplication] connectedScenes]) {
+                if ([scene isKindOfClass:[UIWindowScene class]]) {
+                    window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
+                    break;
+                }
+            }
+        }
+        if (!window) window = [[UIWindow alloc] initWithFrame:[[UIScreen mainScreen] bounds]];
+        window.windowLevel = UIWindowLevelAlert + 100;
+        window.backgroundColor = [UIColor clearColor];
+        window.userInteractionEnabled = NO;
+        [window addSubview:view];
+        [NSLayoutConstraint activateConstraints:@[
+            [view.topAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.topAnchor constant:55],
+            [view.leadingAnchor constraintEqualToAnchor:window.leadingAnchor constant:12],
+            [view.widthAnchor constraintEqualToConstant:265],
+        ]];
+        window.hidden = NO;
+        self.fallbackWindow = window;
+        GPSHUDWriteLog(@"HUD attached to fallback window");
+    }
 
-    window.hidden = NO;
-    self.hudWindow = window;
-
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.5
-                                                  target:self
-                                                selector:@selector(refresh)
-                                                userInfo:nil
-                                                 repeats:YES];
+    if (!self.timer) {
+        self.timer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                      target:self
+                                                    selector:@selector(refresh)
+                                                    userInfo:nil
+                                                     repeats:YES];
+    }
     [self refresh];
-    NSLog(@"[GPSHUD] HUD shown, hookHits=%ld", (long)self.hookHits);
 }
 
 - (void)refresh {
+    // 每次刷新把浮窗置顶，防止被后加的视图盖住
+    UIView *sup = self.hudView.superview;
+    if (sup) [sup bringSubviewToFront:self.hudView];
+
     NSUInteger count = self.managers.allObjects.count;
     CLLocation *best = nil;
     for (CLLocationManager *m in self.managers.allObjects) {
@@ -128,19 +199,18 @@
     } else {
         double acc = best.horizontalAccuracy;
         NSString *level;
-        UIColor *color;
         if (acc < 0) {
-            level = @"无效定位"; color = [UIColor systemRedColor];
+            level = @"无效定位";
         } else if (acc < 8) {
-            level = @"强"; color = [UIColor systemGreenColor];
+            level = @"强";
         } else if (acc < 20) {
-            level = @"良好"; color = [UIColor systemYellowColor];
+            level = @"良好";
         } else if (acc < 50) {
-            level = @"一般"; color = [UIColor systemOrangeColor];
+            level = @"一般";
         } else if (acc < 100) {
-            level = @"弱"; color = [UIColor systemRedColor];
+            level = @"弱";
         } else {
-            level = @"极弱"; color = [UIColor systemRedColor];
+            level = @"极弱";
         }
         double speed = best.speed >= 0 ? best.speed * 3.6 : 0;
         detail = [NSString stringWithFormat:
@@ -152,16 +222,12 @@
         @"GPS HUD 已加载\nhook命中: %ld 次 | 管理器: %lu\n%@",
         (long)self.hookHits, (unsigned long)count, detail];
 
-    NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:text attributes:@{
-        NSForegroundColorAttributeName: [UIColor whiteColor],
-        NSFontAttributeName: [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular],
-    }];
-    self.hudView.label.attributedText = attr;
+    self.hudView.label.text = text;
 }
 
 @end
 
-#pragma mark - Swizzle 实现
+#pragma mark - Swizzle
 
 @interface CLLocationManager (GPSHUD)
 - (instancetype)gpshud_init;
@@ -173,21 +239,18 @@
 @implementation CLLocationManager (GPSHUD)
 
 - (instancetype)gpshud_init {
-    id o = [self gpshud_init]; // 交换后指向原始 init
+    id o = [self gpshud_init];
     [[GPSHUDManager shared] registerManager:o];
     return o;
 }
-
 - (void)gpshud_startUpdatingLocation {
     [self gpshud_startUpdatingLocation];
     [[GPSHUDManager shared] registerManager:self];
 }
-
 - (void)gpshud_requestLocation {
     [self gpshud_requestLocation];
     [[GPSHUDManager shared] registerManager:self];
 }
-
 - (void)gpshud_startMonitoringSignificantLocationChanges {
     [self gpshud_startMonitoringSignificantLocationChanges];
     [[GPSHUDManager shared] registerManager:self];
@@ -195,28 +258,29 @@
 
 @end
 
-// 健壮 swizzle：方法继承自父类时，先添加再替换，避免污染父类
 static void GPSHUDSwizzle(Class cls, SEL origSel, SEL customSel) {
     Method origMethod = class_getInstanceMethod(cls, origSel);
     Method customMethod = class_getInstanceMethod(cls, customSel);
     if (!origMethod || !customMethod) {
-        NSLog(@"[GPSHUD] swizzle skipped: %@", NSStringFromSelector(origSel));
+        GPSHUDWriteLog([NSString stringWithFormat:@"swizzle skipped: %@", NSStringFromSelector(origSel)]);
         return;
     }
     const char *types = method_getTypeEncoding(origMethod);
     IMP origImp = method_getImplementation(origMethod);
     IMP customImp = method_getImplementation(customMethod);
-
     if (class_addMethod(cls, origSel, customImp, types)) {
         class_replaceMethod(cls, customSel, origImp, types);
     } else {
         method_exchangeImplementations(origMethod, customMethod);
     }
-    NSLog(@"[GPSHUD] swizzled: %@", NSStringFromSelector(origSel));
+    GPSHUDWriteLog([NSString stringWithFormat:@"swizzled: %@", NSStringFromSelector(origSel)]);
 }
 
 __attribute__((constructor)) static void GPSHUDLoad(void) {
-    NSLog(@"[GPSHUD] dylib loaded");
+    GPSHUDWriteLog([NSString stringWithFormat:@"dylib loaded, PID=%d", getpid()]);
+
+    // 震动一次：打开高德时震一下 = dylib 确实加载了
+    AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
 
     Class cls = [CLLocationManager class];
     GPSHUDSwizzle(cls, @selector(init), @selector(gpshud_init));
@@ -225,8 +289,11 @@ __attribute__((constructor)) static void GPSHUDLoad(void) {
     GPSHUDSwizzle(cls, @selector(startMonitoringSignificantLocationChanges),
                   @selector(gpshud_startMonitoringSignificantLocationChanges));
 
-    // 延迟显示，等 UIApplication / keyWindow 就绪
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    // 多个时间点尝试显示，确保 keyWindow 就绪
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [[GPSHUDManager shared] showHUD];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         [[GPSHUDManager shared] showHUD];
     });
 }
