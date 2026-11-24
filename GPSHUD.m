@@ -1,23 +1,32 @@
-// GPSHUD.m — 零依赖版本 v2
-// 修复点：
-//  1. iOS 13+ SceneDelegate 下自建 UIWindow 不显示 → 改为挂到宿主 keyWindow
-//  2. 加震动信号：加载成功时震动一下，便于确认 dylib 是否真的被加载
-//  3. 多重显示时机 + 日志，便于诊断
-// 不依赖 Cydia Substrate / ElleKit，适合 TrollFools / TrollStore 注入。
+// GPSHUD.m — 诊断版 v3
+// 目标：找出"重启后不提示信号弱"的根因
+// 新增诊断维度：
+//  1. 数据年龄（最后一条定位距今多久）—— 判断定位服务是否卡住/注入陈旧数据
+//  2. 每个管理器的更新时间 + 精度（区分哪个会话在供数）
+//  3. 精度范围（min/max/avg）+ 采样数
+//  4. 定位回调频率（每秒几次）—— 判断定位流是否活跃
+//  5. 详细日志落盘 gpshud_diag.log，重启前后各导出一份对比
+// 零依赖：仅 objc runtime swizzle，不依赖 Substrate/ElleKit。
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <CoreLocation/CoreLocation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 
-#pragma mark - 日志（NSLog + 落盘，便于导出诊断）
+#pragma mark - 日志
+
+static NSString *GPSHUDLogPath(void) {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    return dir ? [dir stringByAppendingPathComponent:@"gpshud_diag.log"] : nil;
+}
 
 static void GPSHUDWriteLog(NSString *line) {
     NSLog(@"[GPSHUD] %@", line);
-    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    if (!dir) return;
-    NSString *path = [dir stringByAppendingPathComponent:@"gpshud_diag.log"];
-    NSString *full = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], line];
+    NSString *path = GPSHUDLogPath();
+    if (!path) return;
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss";
+    NSString *full = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], line];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
     if (fh) {
         [fh seekToEndOfFile];
@@ -28,7 +37,17 @@ static void GPSHUDWriteLog(NSString *line) {
     }
 }
 
-#pragma mark - 自检浮窗
+#pragma mark - 诊断记录
+
+@interface GPSLocSample : NSObject
+@property (nonatomic, strong) NSDate *time;
+@property (nonatomic, assign) double acc;
+@property (nonatomic, assign) double speed;
+@end
+@implementation GPSLocSample
+@end
+
+#pragma mark - 浮窗
 
 @interface GPSHUDView : UIView
 @property (nonatomic, strong) UILabel *label;
@@ -39,7 +58,7 @@ static void GPSHUDWriteLog(NSString *line) {
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.78];
+        self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.80];
         self.layer.cornerRadius = 10;
         self.layer.borderColor = [UIColor redColor].CGColor;
         self.layer.borderWidth = 1.5;
@@ -48,7 +67,7 @@ static void GPSHUDWriteLog(NSString *line) {
         UILabel *label = [[UILabel alloc] initWithFrame:CGRectZero];
         label.translatesAutoresizingMaskIntoConstraints = NO;
         label.textColor = [UIColor whiteColor];
-        label.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+        label.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
         label.numberOfLines = 0;
         [self addSubview:label];
         self.label = label;
@@ -73,8 +92,21 @@ static void GPSHUDWriteLog(NSString *line) {
 @property (nonatomic, strong) GPSHUDView *hudView;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) NSInteger hookHits;
+
+// 诊断状态
+@property (nonatomic, strong) NSDate *lastLocationTime;      // 最后一次收到定位回调的墙钟时间
+@property (nonatomic, strong) NSDate *lastLocTimestamp;      // 最后一条 CLLocation 的时间戳
+@property (nonatomic, assign) NSInteger updateCount;         // 定位更新次数
+@property (nonatomic, assign) double minAcc;
+@property (nonatomic, assign) double maxAcc;
+@property (nonatomic, assign) double sumAcc;
+@property (nonatomic, assign) NSInteger accSamples;
+@property (nonatomic, strong) NSMutableArray<GPSLocSample *> *history;
+@property (nonatomic, assign) BOOL loggedStall;
+
 + (instancetype)shared;
 - (void)registerManager:(CLLocationManager *)m;
+- (void)noteLocation:(CLLocation *)loc;
 - (void)showHUD;
 @end
 
@@ -91,6 +123,9 @@ static void GPSHUDWriteLog(NSString *line) {
     self = [super init];
     if (self) {
         _managers = [NSHashTable weakObjectsHashTable];
+        _history = [NSMutableArray array];
+        _minAcc = -1;
+        _maxAcc = 0;
     }
     return self;
 }
@@ -101,7 +136,49 @@ static void GPSHUDWriteLog(NSString *line) {
     [self.managers addObject:m];
 }
 
-// 找到当前显示中的 keyWindow（兼容 iOS 13+ SceneDelegate）
+// 记录一次定位，检测是否是新数据
+- (void)noteLocation:(CLLocation *)loc {
+    if (!loc) return;
+    NSDate *ts = loc.timestamp ?: [NSDate date];
+    double acc = loc.horizontalAccuracy;
+
+    BOOL isNew = !self.lastLocTimestamp || [ts timeIntervalSinceDate:self.lastLocTimestamp] > 0.0001;
+    if (isNew) {
+        self.lastLocTimestamp = ts;
+        self.lastLocationTime = [NSDate date];
+        self.updateCount++;
+
+        if (acc >= 0) {
+            if (self.minAcc < 0 || acc < self.minAcc) self.minAcc = acc;
+            if (acc > self.maxAcc) self.maxAcc = acc;
+            self.sumAcc += acc;
+            self.accSamples++;
+        }
+
+        GPSLocSample *s = [[GPSLocSample alloc] init];
+        s.time = self.lastLocationTime;
+        s.acc = acc;
+        s.speed = loc.speed;
+        [self.history addObject:s];
+        if (self.history.count > 200) [self.history removeObjectAtIndex:0];
+
+        self.loggedStall = NO;
+
+        // 每次新数据写日志（含数据年龄 = 定位时间戳到现在的延迟）
+        NSTimeInterval tsAge = [[NSDate date] timeIntervalSinceDate:ts];
+        GPSHUDWriteLog([NSString stringWithFormat:
+            @"NEW #%ld acc=%.1fm speed=%.1f tsAge=%.1fs total=%ld",
+            (long)self.updateCount, acc, loc.speed, tsAge, (long)self.accSamples]);
+    }
+
+    // 检测数据停滞：超过 6 秒没有新定位
+    if (!self.loggedStall && self.lastLocationTime &&
+        [[NSDate date] timeIntervalSinceDate:self.lastLocationTime] > 6) {
+        self.loggedStall = YES;
+        GPSHUDWriteLog(@"STALL: no new location for >6s");
+    }
+}
+
 - (UIWindow *)findKeyWindow {
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in [[UIApplication sharedApplication] connectedScenes]) {
@@ -122,9 +199,7 @@ static void GPSHUDWriteLog(NSString *line) {
 }
 
 - (void)showHUD {
-    if (self.hudView && self.hudView.superview) {
-        return; // 已经显示
-    }
+    if (self.hudView && self.hudView.superview) return;
 
     GPSHUDView *view = [[GPSHUDView alloc] initWithFrame:CGRectZero];
     view.translatesAutoresizingMaskIntoConstraints = NO;
@@ -132,16 +207,14 @@ static void GPSHUDWriteLog(NSString *line) {
 
     UIWindow *host = [self findKeyWindow];
     if (host) {
-        // 方案 A（首选）：直接挂到宿主 keyWindow，必定可见
         [host addSubview:view];
         [NSLayoutConstraint activateConstraints:@[
             [view.topAnchor constraintEqualToAnchor:host.safeAreaLayoutGuide.topAnchor constant:55],
             [view.leadingAnchor constraintEqualToAnchor:host.leadingAnchor constant:12],
-            [view.widthAnchor constraintEqualToConstant:265],
+            [view.widthAnchor constraintEqualToConstant:290],
         ]];
         GPSHUDWriteLog(@"HUD attached to host keyWindow");
     } else {
-        // 方案 B（兜底）：自建 window，绑定 active scene
         UIWindow *window = nil;
         if (@available(iOS 13.0, *)) {
             for (UIScene *scene in [[UIApplication sharedApplication] connectedScenes]) {
@@ -159,7 +232,7 @@ static void GPSHUDWriteLog(NSString *line) {
         [NSLayoutConstraint activateConstraints:@[
             [view.topAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.topAnchor constant:55],
             [view.leadingAnchor constraintEqualToAnchor:window.leadingAnchor constant:12],
-            [view.widthAnchor constraintEqualToConstant:265],
+            [view.widthAnchor constraintEqualToConstant:290],
         ]];
         window.hidden = NO;
         self.fallbackWindow = window;
@@ -177,7 +250,6 @@ static void GPSHUDWriteLog(NSString *line) {
 }
 
 - (void)refresh {
-    // 每次刷新把浮窗置顶，防止被后加的视图盖住
     UIView *sup = self.hudView.superview;
     if (sup) [sup bringSubviewToFront:self.hudView];
 
@@ -191,36 +263,44 @@ static void GPSHUDWriteLog(NSString *line) {
              (best.horizontalAccuracy < 0 || l.horizontalAccuracy < best.horizontalAccuracy))) {
             best = l;
         }
+        [self noteLocation:l]; // 记录每个管理器的数据（内部按时间戳去重）
     }
 
-    NSString *detail;
-    if (!best) {
-        detail = count > 0 ? @"已捕获定位管理器,等待定位数据…" : @"未捕获定位管理器(hook 未命中)";
-    } else {
-        double acc = best.horizontalAccuracy;
-        NSString *level;
-        if (acc < 0) {
-            level = @"无效定位";
-        } else if (acc < 8) {
-            level = @"强";
-        } else if (acc < 20) {
-            level = @"良好";
-        } else if (acc < 50) {
-            level = @"一般";
-        } else if (acc < 100) {
-            level = @"弱";
-        } else {
-            level = @"极弱";
-        }
-        double speed = best.speed >= 0 ? best.speed * 3.6 : 0;
-        detail = [NSString stringWithFormat:
-                  @"水平精度: %.1f m\n信号等级: %@\n速度: %.1f km/h\n海拔: %.1f m",
-                  acc, level, speed, best.altitude];
-    }
+    // 数据年龄：最后一次新定位距今多久
+    double dataAge = self.lastLocationTime ? [[NSDate date] timeIntervalSinceDate:self.lastLocationTime] : -1;
+
+    NSString *level;
+    double acc = best ? best.horizontalAccuracy : -1;
+    if (acc < 0) level = @"无效";
+    else if (acc < 8) level = @"强";
+    else if (acc < 20) level = @"良好";
+    else if (acc < 50) level = @"一般";
+    else if (acc < 100) level = @"弱";
+    else level = @"极弱";
+
+    NSString *rangeStr = self.accSamples > 0
+        ? [NSString stringWithFormat:@"%.1f~%.1f(均%.1f)", self.minAcc, self.maxAcc, self.sumAcc / self.accSamples]
+        : @"—";
+
+    NSString *ageStr = dataAge < 0 ? @"—" : [NSString stringWithFormat:@"%.1fs", dataAge];
+    NSString *fresh;
+    if (dataAge < 0) fresh = @"无数据";
+    else if (dataAge < 3) fresh = @"新鲜";
+    else if (dataAge < 8) fresh = @"偏旧";
+    else fresh = @"停滞!";
 
     NSString *text = [NSString stringWithFormat:
-        @"GPS HUD 已加载\nhook命中: %ld 次 | 管理器: %lu\n%@",
-        (long)self.hookHits, (unsigned long)count, detail];
+        @"GPS 诊断 v3 | %@\n"
+        @"精度 %.1fm [%@] 新数据 %ld 次\n"
+        @"数据年龄 %@ (%@) 会话 %lu\n"
+        @"精度范围 %@\n"
+        @"速度 %.1fkm/h 海拔 %.0fm\n"
+        @"hook %ld | 日志: Documents/gpshud_diag.log",
+        acc >= 0 ? level : @"无定位", acc, level, (long)self.updateCount,
+        ageStr, fresh, (unsigned long)count,
+        rangeStr,
+        best && best.speed >= 0 ? best.speed * 3.6 : 0, best ? best.altitude : 0,
+        (long)self.hookHits];
 
     self.hudView.label.text = text;
 }
@@ -261,10 +341,7 @@ static void GPSHUDWriteLog(NSString *line) {
 static void GPSHUDSwizzle(Class cls, SEL origSel, SEL customSel) {
     Method origMethod = class_getInstanceMethod(cls, origSel);
     Method customMethod = class_getInstanceMethod(cls, customSel);
-    if (!origMethod || !customMethod) {
-        GPSHUDWriteLog([NSString stringWithFormat:@"swizzle skipped: %@", NSStringFromSelector(origSel)]);
-        return;
-    }
+    if (!origMethod || !customMethod) return;
     const char *types = method_getTypeEncoding(origMethod);
     IMP origImp = method_getImplementation(origMethod);
     IMP customImp = method_getImplementation(customMethod);
@@ -273,13 +350,10 @@ static void GPSHUDSwizzle(Class cls, SEL origSel, SEL customSel) {
     } else {
         method_exchangeImplementations(origMethod, customMethod);
     }
-    GPSHUDWriteLog([NSString stringWithFormat:@"swizzled: %@", NSStringFromSelector(origSel)]);
 }
 
 __attribute__((constructor)) static void GPSHUDLoad(void) {
-    GPSHUDWriteLog([NSString stringWithFormat:@"dylib loaded, PID=%d", getpid()]);
-
-    // 震动一次：打开高德时震一下 = dylib 确实加载了
+    GPSHUDWriteLog(@"=== dylib loaded, diagnostic v3 ===");
     AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
 
     Class cls = [CLLocationManager class];
@@ -289,7 +363,6 @@ __attribute__((constructor)) static void GPSHUDLoad(void) {
     GPSHUDSwizzle(cls, @selector(startMonitoringSignificantLocationChanges),
                   @selector(gpshud_startMonitoringSignificantLocationChanges));
 
-    // 多个时间点尝试显示，确保 keyWindow 就绪
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         [[GPSHUDManager shared] showHUD];
     });
