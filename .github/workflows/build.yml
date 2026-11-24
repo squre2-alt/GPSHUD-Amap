@@ -40,11 +40,26 @@ jobs:
           make clean || true
           make package
 
+      - name: Build dependency-free dylib (no Substrate/ElleKit)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          mkdir -p nodeps
+          clang -target arm64-apple-ios15.0 \
+            -isysroot "$SDK" \
+            -fobjc-arc -fobjc-runtime=ios-15.0 \
+            -dynamiclib \
+            -framework Foundation -framework UIKit -framework CoreLocation \
+            -o nodeps/GPSHUD-nodeps.dylib GPSHUD.m
+          ldid -S nodeps/GPSHUD-nodeps.dylib
+          ls -lh nodeps/GPSHUD-nodeps.dylib
+
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
           find . -maxdepth 3 -name '*.deb' -path './packages/*' -exec cp {} artifacts/ \;
           find .theos -name 'GPSHUD.dylib' -exec cp {} artifacts/ \; 2>/dev/null || true
+          cp nodeps/GPSHUD-nodeps.dylib artifacts/ 2>/dev/null || true
           ls -la artifacts/
 
       - name: Upload build artifacts
