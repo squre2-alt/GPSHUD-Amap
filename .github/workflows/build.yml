@@ -50,7 +50,7 @@ jobs:
             -fobjc-arc -fobjc-runtime=ios-15.0 \
             -dynamiclib \
             -framework Foundation -framework UIKit -framework CoreLocation \
-            -framework CoreGraphics -framework QuartzCore \
+            -framework CoreGraphics -framework QuartzCore -framework AudioToolbox \
             -Wl,-undefined,dynamic_lookup \
             -o nodeps/GPSHUD-nodeps.dylib GPSHUD.m
           ldid -S nodeps/GPSHUD-nodeps.dylib
