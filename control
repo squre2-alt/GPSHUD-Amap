@@ -1,0 +1,8 @@
+Package: com.gpshud.amap
+Name: GPSHUD for Amap
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Shows a GPS accuracy HUD inside Amap (Gaode Maps) to help diagnose weak navigation signal.
+Maintainer: WorkBuddy
+Author: WorkBuddy
+Section: Tweaks
